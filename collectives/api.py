@@ -2,11 +2,15 @@
 from __future__ import annotations
 
 import heapq
-from typing import Callable, List, Optional
+import logging
+from typing import Any, Callable, Dict, List, Optional
+
 import numpy as np
 
-from .datatypes import ShardRequest, AssociativeReduction
-from .shardbuffer import ShardBuffer
+from .datatypes import AssociativeReduction, ShardRequest
+from .shardbuffer import ShardBuffer, ShardedArray
+
+logger = logging.getLogger(__name__)
 
 
 class Device:
@@ -19,9 +23,12 @@ class Device:
         hop_latency: int,
         left: Optional["Device"] = None,
         right: Optional["Device"] = None,
+        add_communication_noise: bool = False,
+        communication_noise_mean: float = 0.0,
+        communication_noise_std: float = 0.01,
     ):
         self.scheduler = scheduler
-        self.shards = ShardBuffer(world_size, shard_size)
+        self.shards = ShardedArray(world_size, shard_size)
         self.rank = rank
         self.world_size = world_size
         self.shard_size = shard_size
@@ -29,15 +36,11 @@ class Device:
         # Define topology
         self.left = left
         self.right = right
+        self.add_communication_noise = add_communication_noise
+        self.communication_noise_mean = communication_noise_mean
+        self.communication_noise_std = communication_noise_std
 
-        # precompute directions for sending
-        self._dir = {}
-        for i in range(world_size):
-            cw = (i - rank) % world_size
-            ccw = (rank - i) % world_size
-            self._dir[i] = -1 if cw <= ccw else 1
-
-    def put(self, i, shard: np.ndarray) -> None:
+    def put(self, i, shard: ShardBuffer) -> None:
         # places a shard in a slot and overwrites
         self.shards.put(i, shard)
 
@@ -56,8 +59,15 @@ class Device:
         retain: bool = True,
         direction: Optional[int] = None,
     ) -> None:
-        shard = self.shards[i]
-        assert not np.isnan(shard).all(), f"Shard slot={i} on rank={self.rank} is empty"
+        shard = self.shards.get(i)
+        assert not np.isnan(shard).all(), (
+            f"Shard slot={i} on rank={self.rank} is empty"
+        )
+
+        _metadata = {
+            "checksum": shard.checksum,
+        }
+
         if blocking:
             to.recv(
                 i,
@@ -66,9 +76,10 @@ class Device:
                 reduction=reduction,
                 auto_forward=auto_forward,
                 direction=direction,
+                metadata=_metadata,
             )
         else:
-            print(f"DEBUG(send):rank={self.rank} sending shard={i} to {to.rank}")
+            logger.debug(f"rank={self.rank} sending shard={i} to {to.rank}")
             self.scheduler.schedule(
                 time=time,
                 latency=self.hop_latency,
@@ -76,6 +87,7 @@ class Device:
                 src=self,
                 dst=to,
                 payload=shard.copy(),
+                metadata=_metadata,
                 reduction=reduction,
                 auto_forward=auto_forward,
                 retain=retain,
@@ -90,43 +102,52 @@ class Device:
         self,
         i: int,
         time: int,
-        shard: np.ndarray,
+        shard: ShardBuffer,
         reduction: Optional[AssociativeReduction] = None,
         auto_forward: bool = False,
         blocking: bool = False,
         retain: bool = True,
         direction: Optional[int] = None,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> None:
         """
         Place `shard` into slot `i`. If `reduction` is specified, reduce
         with the existing shard; otherwise, slot must be empty.
         """
-        existing = self.shards[i]
+
+        if metadata is not None and metadata.get("checksum") != shard.checksum:
+            logger.debug("SDC detected, checksums do not match")
+
+        existing = self.shards.get(i)
         if reduction is None:
             # assert existing is None, f"attempting overwrite at {i} when reduction=None"
             if not np.all(np.isnan(existing)):
                 return
-            self.shards[i] = shard.copy()
+            self.shards.put(i, shard.copy())
         else:
             if not np.all(np.isnan(existing)):
                 if reduction == "sum":
-                    self.shards[i] = existing + shard
+                    self.shards.put(i, ShardBuffer(existing + shard))
                 elif reduction == "max":
-                    self.shards[i] = np.maximum(existing, shard)
+                    self.shards.put(
+                        i, ShardBuffer(np.maximum(existing, shard))
+                    )
                 elif reduction == "min":
-                    self.shards[i] = np.minimum(existing, shard)
+                    self.shards.put(
+                        i, ShardBuffer(np.minimum(existing, shard))
+                    )
                 else:
                     raise ValueError(f"Unknown reduction: {reduction}")
             else:
-                self.shards[i] = shard
+                self.shards.put(i, shard.copy())
                 return
 
         if auto_forward:
             if direction is None:
-                direction = self._dir[i]
+                direction = self.scheduler.get_direction(self.rank, i, self.world_size)
 
-            print(
-                f"DEBUG(recv):rank={self.rank} got shard={i}, sending to={'right' if direction == 1 else 'left'}"
+            logger.debug(
+                f"rank={self.rank} got shard={i}, sending to={'right' if direction == 1 else 'left'}"
             )
 
             # Event-driven firing off a send to the next device
@@ -159,18 +180,33 @@ class Device:
         # build rows of slot content
         MAX_DISPLAY = 4
         rows = []
-        for shard in self.shards.data:
+        for shard in self.shards:
             if shard is None:
                 content = ""
             else:
                 arr = shard.tolist()
                 n = len(arr)
                 if n <= MAX_DISPLAY:
-                    content = " ".join(str(x) for x in arr)
+                    content = " ".join(
+                        f"{x:.3f}"
+                        if isinstance(x, float) or isinstance(x, np.floating)
+                        else str(x)
+                        for x in arr
+                    )
                 else:
                     half = MAX_DISPLAY // 2
-                    front = " ".join(str(x) for x in arr[:half])
-                    back = " ".join(str(x) for x in arr[-half:])
+                    front = " ".join(
+                        f"{x:.3f}"
+                        if isinstance(x, float) or isinstance(x, np.floating)
+                        else str(x)
+                        for x in arr[:half]
+                    )
+                    back = " ".join(
+                        f"{x:.3f}"
+                        if isinstance(x, float) or isinstance(x, np.floating)
+                        else str(x)
+                        for x in arr[-half:]
+                    )
                     content = f"{front} … {back}"
             rows.append(f"[{content}]")
 
@@ -195,6 +231,12 @@ class Scheduler:
     def __init__(self):
         self._pipe: List[ShardRequest] = []
 
+    @staticmethod
+    def get_direction(src_rank: int, dst_rank: int, world_size: int) -> int:
+        cw = (dst_rank - src_rank) % world_size
+        ccw = (src_rank - dst_rank) % world_size
+        return -1 if cw <= ccw else 1
+
     def schedule(
         self,
         time: int,
@@ -202,12 +244,23 @@ class Scheduler:
         i: int,
         src: Device,
         dst: Device,
-        payload: np.ndarray,
+        payload: ShardBuffer,
+        metadata: Dict[str, Any],
         auto_forward: bool,
         reduction: Optional[AssociativeReduction],
         retain: bool,
         direction: Optional[int],
     ):
+        # Add simulated inflight communication noise to the shard if needed
+        if src.add_communication_noise:
+            payload = ShardBuffer(
+                payload
+                + np.random.normal(
+                    src.communication_noise_mean,
+                    src.communication_noise_std,
+                    payload.shape,
+                )
+            )
         heapq.heappush(
             self._pipe,
             ShardRequest(
@@ -216,6 +269,7 @@ class Scheduler:
                 src=src,
                 dst=dst,
                 payload=payload,
+                metadata=metadata,  # type: ignore
                 auto_forward=auto_forward,
                 reduction=reduction,
                 retain=retain,
@@ -236,60 +290,5 @@ class Scheduler:
                 auto_forward=req.auto_forward,
                 retain=req.retain,
                 direction=req.direction,
+                metadata=req.metadata,  # type: ignore
             )
-            visualize_topology(start)
-
-
-def visualize_topology(start: Device, ring=True):
-    seen = set()
-    cur = start
-    order = []
-    while cur is not None and id(cur) not in seen:
-        seen.add(id(cur))
-        order.append(cur)
-        cur = cur.right
-
-    blocks = [d.__str__().splitlines() for d in order]
-    height = max(len(b) for b in blocks)
-
-    # render
-    for row in range(height):
-        line_parts = []
-        for i, blk in enumerate(blocks):
-            line_parts.append(blk[row])
-            if row == height // 2:
-                if i < len(order) - 1:
-                    line_parts.append(" <-> ")
-                elif ring:
-                    line_parts.append("  ↺  ")
-            else:
-                line_parts.append(" " * 5)
-        if ring:
-            if row == height // 2:
-                line_parts.insert(0, "  ↺  ")
-            else:
-                line_parts.insert(0, " " * 5)
-        print("".join(line_parts))
-
-
-def create_node(world_size: int, shard_size: int, hop_latency: int) -> tuple["Scheduler", list["Device"]]:
-    scheduler = Scheduler()
-    head = Device(0, world_size, scheduler, shard_size, hop_latency)
-    prev = head
-    cur = None
-
-    device_list = [head]
-
-    # Implement the chaining
-    for rank in range(1, world_size):
-        cur = Device(rank, world_size, scheduler, shard_size, hop_latency, left=prev)
-        device_list.append(cur)
-        prev.right = cur
-        prev = cur
-
-    # Wraparound
-    tail = prev
-    head.left = tail
-    tail.right = head
-
-    return scheduler, device_list

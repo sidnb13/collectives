@@ -5,12 +5,13 @@ from .api import (
     Scheduler,
 )
 from .datatypes import AssociativeReduction
+from .shardbuffer import ShardBuffer
 
 
 def reset_state_allgather(device_list: list[Device], world_size: int, shard_size: int):
     for i, device in enumerate(device_list):
         device.reset()
-        device.put(i, np.ones(shard_size) * i)
+        device.put(i, ShardBuffer(np.ones(shard_size) * i))
 
 
 def all_gather(
@@ -31,18 +32,21 @@ def all_gather(
 
     for rank in range(world_size):
         src = device_list[rank]
-        if src._dir[rank] == -1:  # cw
+        direction = Scheduler.get_direction(src.rank, rank, world_size)
+        if direction == -1:  # cw
             dst = src.left
         else:  # ccw
             dst = src.right
 
+        payload = src.shards[rank].copy()
         scheduler.schedule(
             time=0,
             latency=hop_latency,
             i=rank,
             src=src,
             dst=dst,  # type: ignore
-            payload=src.shards[rank].copy(),
+            payload=payload,
+            metadata={"checksum": payload.checksum},
             auto_forward=True,
             reduction=None,
             retain=True,
@@ -52,11 +56,13 @@ def all_gather(
     scheduler.run(start=device_list[0], stopping_condition=stopping_condition)
 
 
-def reset_state_reduce_scatter(device_list: list[Device], world_size: int, shard_size: int):
+def reset_state_reduce_scatter(
+    device_list: list[Device], world_size: int, shard_size: int
+):
     for i, device in enumerate(device_list):
         device.reset()
         for j in range(world_size):
-            device.put(j, np.ones(shard_size) * j)
+            device.put(j, ShardBuffer(np.ones(shard_size) * j))
 
 
 def reduce_scatter(
@@ -81,13 +87,15 @@ def reduce_scatter(
         src = device_list[rank]
         dst = src.right
 
+        payload = src.shards[rank].copy()
         scheduler.schedule(
             time=0,
             latency=hop_latency,
             i=rank,
             src=src,
             dst=dst,  # type: ignore
-            payload=src.shards[rank].copy(),
+            payload=payload,
+            metadata={"checksum": payload.checksum},
             auto_forward=True,
             reduction=reduction,
             retain=False,
